@@ -1,0 +1,329 @@
+import type { ZurichApoliceFicheiro, ZurichClienteFicheiro } from "./file-parser";
+import { parseZurichFileDecimal } from "./file-parser";
+import { compactMetadata } from "@/lib/insurance/sync/client-metadata";
+import { pickEmail, pickPhone } from "@/lib/insurance/sync/client-contacts";
+import { PLACEHOLDER_CLIENT_PREFIX } from "@/lib/insurance/sync/client-placeholder";
+
+/*
+ * Mesma "forma" que NormalizedPrevoirPolicy / NormalizedPolicy
+ * (@/lib/insurance/types) — TypeScript compara por estrutura,
+ * por isso não precisa de ser literalmente o mesmo tipo importado
+ * para passar em upsertPolicy().
+ */
+export type NormalizedZurichPolicy = {
+  externalId: string;
+  externalVersion: string | null;
+
+  policyNumber: string;
+
+  productCode: string;
+  productName: string | null;
+
+  insuranceLineCode: string | null;
+
+  status:
+    | "ACTIVE"
+    | "PENDING"
+    | "CANCELLED"
+    | "EXPIRED"
+    | "SUSPENDED"
+    | "REDUCED"
+    | "UNKNOWN";
+
+  issueDate: string | null;
+  startDate: string | null;
+  renewalDate: string | null;
+
+  commercialPremium: number | null;
+  totalPremium: number | null;
+  annualizedPremium: number | null;
+
+  paymentFrequency:
+    | "ANNUAL"
+    | "SEMIANNUAL"
+    | "QUARTERLY"
+    | "MONTHLY"
+    | "SINGLE"
+    | "OTHER"
+    | "UNKNOWN";
+
+  agentCode: string | null;
+  agentName: string | null;
+  teamName: string | null;
+
+  storeExternalCode: string | null;
+
+  client: {
+    name: string;
+    nif: string | null;
+    birthDate: string | null;
+    street: string | null;
+    postalCode: string | null;
+    city: string | null;
+    // Contactos, quando a companhia os envia. Só preenchem o que
+    // estiver vazio no CRM (ver sync/client-contacts).
+    phone?: string | null;
+    email?: string | null;
+    // Tudo o que a companhia envia sobre o cliente (para a aba
+    // "Dados do cliente"). Guardado em client_external_refs.
+    metadata?: Record<string, unknown>;
+    // Ficha do cliente não veio (ver o tipo da Prévoir).
+    dataMissing?: boolean;
+  };
+
+  providerMetadata: Record<string, unknown>;
+};
+
+function toDateOnly(value: string): string | null {
+  const trimmed = value.trim();
+
+  if (!trimmed || trimmed.startsWith("01-01-1900")) {
+    return null;
+  }
+
+  const match = trimmed.match(/^(\d{2})-(\d{2})-(\d{4})/);
+
+  if (!match) {
+    return null;
+  }
+
+  const [, day, month, year] = match;
+  return `${year}-${month}-${day}`;
+}
+
+function normalizeStatus(
+  estado: string,
+): NormalizedZurichPolicy["status"] {
+  const status = estado.trim().toLowerCase();
+
+  switch (status) {
+    case "em vigor":
+    case "revalidada":
+    case "normal":
+    // Mesma regra da Prévoir: o cliente levantou parte do capital,
+    // mas a apólice continua em vigor.
+    case "parcialmente resgatada":
+      return "ACTIVE";
+
+    case "anulada":
+      return "CANCELLED";
+
+    case "proposta":
+      return "PENDING";
+
+    case "caducada":
+    case "expirada":
+      return "EXPIRED";
+
+    case "reduzida":
+      return "REDUCED";
+
+    default:
+      return "UNKNOWN";
+  }
+}
+
+function normalizeFrequency(
+  fraccionamento: string,
+): NormalizedZurichPolicy["paymentFrequency"] {
+  const frequency = fraccionamento.trim().toLowerCase();
+
+  switch (frequency) {
+    case "anual":
+      return "ANNUAL";
+    case "semestral":
+      return "SEMIANNUAL";
+    case "trimestral":
+      return "QUARTERLY";
+    case "mensal":
+      return "MONTHLY";
+    case "único":
+    case "unico":
+      return "SINGLE";
+    case "":
+      return "UNKNOWN";
+    default:
+      return "OTHER";
+  }
+}
+
+/*
+ * IMPORTANTE: heurística por agora — a Zurich não documenta um
+ * mapeamento explícito de LinhaNegocioDesc para os teus códigos
+ * internos de ramo. Confirma contra a tua tabela `insurance_lines`
+ * e ajusta/estende esta função conforme os ramos reais que
+ * encontrares (Auto, Multirriscos, Vida, etc.).
+ */
+function mapInsuranceLine(
+  linhaNegocioDesc: string | null,
+): string | null {
+  const normalized = linhaNegocioDesc?.trim().toLowerCase() ?? "";
+
+  if (normalized.includes("auto")) {
+    return "AUTO";
+  }
+
+  return null;
+}
+
+/*
+ * Dados do cliente a partir da ficha Zurich (ficheiro diário ou
+ * webservice — ver fichaFromWebservice). Partilhado pelo sync e pela
+ * recuperação de nomes (recover-client-names.ts).
+ */
+export function mapZurichClient(
+  cliente: ZurichClienteFicheiro | null,
+  nif: string | null,
+): NormalizedZurichPolicy["client"] {
+  return {
+    name:
+      cliente?.NomeCliente.trim() ||
+      `${PLACEHOLDER_CLIENT_PREFIX}${nif ?? "desconhecido"}`,
+    nif,
+    birthDate: cliente ? toDateOnly(cliente.DataNascimento) : null,
+    street: cliente?.Morada.trim() || null,
+    postalCode:
+      cliente && cliente.CodigoPostal.trim()
+        ? `${cliente.CodigoPostal.trim()}${
+            cliente.OrdemPostal.trim() ? `-${cliente.OrdemPostal.trim()}` : ""
+          }`
+        : null,
+    city:
+      cliente?.LocalidadePostal.trim() ||
+      cliente?.Localidade.trim() ||
+      null,
+    // Telemóvel primeiro: é o que serve para ligar/WhatsApp.
+    phone: cliente ? pickPhone(cliente.Telemovel, cliente.Telefone) : null,
+    email: cliente ? pickEmail(cliente.Email) : null,
+    // Ficha completa do cliente (sexo, profissão, contactos, CC,
+    // NIB, ...), sem campos vazios.
+    metadata: cliente ? compactMetadata({ ...cliente }) : undefined,
+    // Sem ficha (cliente antigo/anulado que a Zurich já não devolve,
+    // ou consulta falhada): o nome acima é só o provisório.
+    dataMissing: !cliente,
+  };
+}
+
+/*
+ * Ficha devolvida pelo webservice (ObterClientePorIDNIF) no formato
+ * do ficheiro diário. O webservice dá as datas em ISO (AAAA-MM-DD…)
+ * e o ficheiro em DD-MM-AAAA: convertem-se, senão a data de
+ * nascimento perdia-se.
+ */
+export function fichaFromWebservice(
+  dados: Record<string, unknown>,
+): ZurichClienteFicheiro {
+  const text = (key: string) => {
+    const value = dados[key];
+    if (value === null || value === undefined) return "";
+
+    const raw = String(value);
+    const iso = raw.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    return iso ? `${iso[3]}-${iso[2]}-${iso[1]}` : raw;
+  };
+
+  return {
+    IDCliente: text("IDCliente"),
+    NomeCliente: text("NomeCliente"),
+    Morada: text("Morada"),
+    Localidade: text("Localidade"),
+    CodigoPostal: text("CodigoPostal"),
+    OrdemPostal: text("OrdemPostal"),
+    LocalidadePostal: text("LocalidadePostal") || text("Localidade"),
+    Pais: text("Pais"),
+    NIF: text("NIF"),
+    Telefone: text("Telefone"),
+    Telemovel: text("Telemovel"),
+    Fax: text("Fax"),
+    Email: text("Email"),
+    NCartaoIdentificacao: text("NCartaoIdentificacao"),
+    DataNascimento: text("DataNascimento"),
+    Tipo: text("Tipo"),
+    Sexo: text("Sexo"),
+    CodigoAtividade: text("CodigoAtividade"),
+    NomeAtividade: text("NomeAtividade"),
+    EstadoCivil: text("EstadoCivil"),
+    Filhos: text("Filhos"),
+    NIB: text("NIB"),
+    CodSituacao: text("CodSituacao"),
+    Situacao: text("Situacao"),
+    DataUltimaAlteracao: text("DataUltimaAlteracao"),
+    Zurich4You: "",
+    RecDocPorEmail: "",
+    DataAtualizacaoTipoCliente: "",
+  };
+}
+
+export function mapZurichPolicy(
+  source: ZurichApoliceFicheiro,
+  cliente: ZurichClienteFicheiro | null,
+): NormalizedZurichPolicy {
+  const nif = source.NIF.trim() || null;
+
+  return {
+    externalId: source.NumeroApolice.trim(),
+
+    // A Zurich não expõe um número de versão de apólice nos
+    // dados que temos disponíveis.
+    externalVersion: null,
+
+    policyNumber: source.NumeroApolice.trim(),
+
+    productCode: source.LinhaNegocioCod.trim(),
+    productName: source.LinhaNegocioDesc.trim() || null,
+
+    insuranceLineCode: mapInsuranceLine(source.LinhaNegocioDesc),
+
+    status: normalizeStatus(source.Estado),
+
+    issueDate: toDateOnly(source.DataCriacao),
+    startDate: toDateOnly(source.DataInicio),
+    renewalDate: toDateOnly(source.DataRevalidacao),
+
+    // A Zurich só dá um valor de prémio (PremioApolice), sem
+    // distinguir comercial/total/anualizado como a Prévoir.
+    // A Zurich só dá um valor de prémio (PremioApolice). O nome do
+    // campo, e o facto de o valor não mudar consoante o
+    // Fraccionamento (Anual/Semestral/Trimestral só descreve como
+    // se paga, não o valor em si), sugerem que já é o valor ANUAL
+    // da apólice — por isso preenchemos os dois campos com o mesmo
+    // valor. Se em algum caso real isto não bater certo (ex:
+    // aparecer o valor por prestação em vez do anual), avisa-me
+    // para ajustarmos com base no Fraccionamento.
+      commercialPremium: null,
+      totalPremium: parseZurichFileDecimal(source.PremioApolice),
+      annualizedPremium: parseZurichFileDecimal(source.PremioApolice),
+      // Fraccionamento (descrição) vem em cada apólice. Valores que a
+      // Zurich envie e que não estejam previstos em normalizeFrequency
+      // ficam "OTHER" (nunca se inventa); o valor bruto (código e
+      // descrição) é preservado em provider_metadata.paymentFrequencyRaw
+      // pelo enriquecimento, para auditoria.
+      paymentFrequency: normalizeFrequency(source.Fraccionamento),
+
+    // Não temos dados de agente/equipa vindos da API da Zurich.
+    agentCode: null,
+    agentName: null,
+    teamName: null,
+
+    // AgenteAngariador é o candidato mais próximo de um
+    // identificador de loja/agência — tal como o idUtlizador
+    // na Prévoir, o mapping real para loja fica em
+    // store_external_refs, não aqui.
+    storeExternalCode: source.AgenteAngariador.trim() || null,
+
+    client: mapZurichClient(cliente, nif),
+
+    providerMetadata: {
+      ramo: source.Ramo,
+      linhaNegocioCod: source.LinhaNegocioCod,
+      estadoCod: source.EstadoCod,
+      fraccionamentoCod: source.FraccionamentoCod,
+      iban: source.IBAN || null,
+      idCliente: source.IDCliente,
+      agenteAngariador: source.AgenteAngariador,
+      agenteCobrador: source.AgenteCobrador,
+      dataCancelamento: toDateOnly(source.DataCancelamento),
+      dataFim: toDateOnly(source.DataFim),
+    },
+  };
+}
